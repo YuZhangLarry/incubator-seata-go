@@ -49,6 +49,14 @@ type (
 // BuildExecutor use db type and transaction type to build an executor. the executor can
 // add custom hook, and intercept the user's business sql to generate the undo log.
 func BuildExecutor(dbType types.DBType, transactionMode types.TransactionMode, query string) (SQLExecutor, error) {
+	// For XA mode, use plain executor without AT-specific hooks
+	// XA transactions use two-phase commit protocol managed by TC, they don't need undo logs
+	if transactionMode == types.XAMode {
+		e := &BaseExecutor{}
+		e.Interceptors(commonHook)
+		return e, nil
+	}
+
 	parseContext, err := parser.DoParser(query)
 	if err != nil {
 		return nil, err

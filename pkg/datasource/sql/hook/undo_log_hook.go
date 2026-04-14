@@ -40,6 +40,12 @@ func (h *undoLogSQLHook) Type() types.SQLType {
 
 // Before
 func (h *undoLogSQLHook) Before(ctx context.Context, execCtx *types.ExecContext) error {
+	// Skip undo log generation for XA mode
+	// XA transactions use two-phase commit protocol managed by TC, they don't need undo logs
+	if execCtx.TxCtx.TransactionMode == types.XAMode {
+		return nil
+	}
+
 	if !tm.IsGlobalTx(ctx) {
 		return nil
 	}
@@ -66,6 +72,11 @@ func (h *undoLogSQLHook) Before(ctx context.Context, execCtx *types.ExecContext)
 
 // After
 func (h *undoLogSQLHook) After(ctx context.Context, execCtx *types.ExecContext) error {
+	// Skip undo log generation for XA mode
+	if execCtx.TxCtx.TransactionMode == types.XAMode {
+		return nil
+	}
+
 	if !tm.IsGlobalTx(ctx) {
 		return nil
 	}

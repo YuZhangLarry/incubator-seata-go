@@ -190,6 +190,24 @@ func (db *DBResource) Release(xaBranchID string) {
 	db.keeper.Delete(xaBranchID)
 }
 
+// UnregisterXABranch removes an XA branch from the keeper registry.
+// This should be called after phase 2 commit/rollback to clean up the registration.
+func (db *DBResource) UnregisterXABranch(xaBranchID string) {
+	db.keeper.Delete(xaBranchID)
+}
+
+// GetXABranch retrieves an XA connection by branch XID from the keeper registry.
+// Returns the XA connection if found, nil otherwise.
+// Note: The returned connection should be treated as read-only to avoid concurrent modification issues.
+func (db *DBResource) GetXABranch(xaBranchID string) *XAConn {
+	if conn, ok := db.Lookup(xaBranchID); ok {
+		if xaConn, ok := conn.(*XAConn); ok {
+			return xaConn
+		}
+	}
+	return nil
+}
+
 func (db *DBResource) Lookup(xaBranchID string) (interface{}, bool) {
 	return db.keeper.Load(xaBranchID)
 }

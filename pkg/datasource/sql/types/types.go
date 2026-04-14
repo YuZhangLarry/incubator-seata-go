@@ -121,7 +121,7 @@ func (t TransactionMode) BranchType() branch.BranchType {
 	}
 }
 
-// TransactionContext seata-go‘s context of transaction
+// TransactionContext seata-go’s context of transaction
 type TransactionContext struct {
 	// LocalTransID locals transaction id
 	LocalTransID string
@@ -132,6 +132,18 @@ type TransactionContext struct {
 	// TxOpt transaction option
 	TxOpt driver.TxOptions
 	// TransactionMode transaction mode, eg. XA/AT
+	//
+	// Supported modes:
+	//   - Local: Regular local transaction, no distributed transaction involved
+	//   - XAMode: XA distributed transaction using two-phase commit protocol
+	//   - ATMode: AT (Automatic Transaction) mode using undo logs for compensation
+	//
+	// In auto-commit mode with XAMode:
+	//   - Each SQL execution automatically creates a new XA branch
+	//   - The branch is registered and started (XA START xid)
+	//   - After execution, the branch is prepared (XA PREPARE) and committed (XA COMMIT)
+	//   - This mode is useful for single-statement global transactions
+	//   - For multi-statement transactions, explicitly call BeginTx to reuse the same branch
 	TransactionMode TransactionMode
 	// ResourceID resource id, database-table
 	ResourceID string

@@ -135,6 +135,17 @@ func (tx *Tx) Rollback() error {
 		}
 	}
 
+	// In XA mode, target may be nil (set via withOriginTx(nil)).
+	// Only allow nil target when explicitly in XA mode; otherwise,
+	// treat it as an error to avoid masking unexpected driver/initialization bugs.
+	if tx.target == nil {
+		if tx.tranCtx != nil && tx.tranCtx.TransactionMode == types.XAMode {
+			// XA transactions are managed separately
+			return nil
+		}
+		return fmt.Errorf("sql.Tx Rollback: underlying transaction is nil in non-XA mode")
+	}
+
 	return tx.target.Rollback()
 }
 

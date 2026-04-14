@@ -185,16 +185,7 @@ func (c *XAConn) createNewTxOnExecIfNeed(ctx context.Context, f func() (types.Ex
 	)
 
 	defer func() {
-		recoverErr := recover()
-		if err != nil || recoverErr != nil {
-			log.Errorf("conn at rollback  error:%v or recoverErr:%v", err, recoverErr)
-			if c.tx != nil {
-				rollbackErr := c.tx.Rollback()
-				if rollbackErr != nil {
-					log.Errorf("conn at rollback error:%v", rollbackErr)
-				}
-			}
-		}
+		c.handlePanicCleanup(ctx, err, recover())
 	}()
 
 	currentAutoCommit := c.autoCommit
@@ -208,7 +199,8 @@ func (c *XAConn) createNewTxOnExecIfNeed(ctx context.Context, f func() (types.Ex
 	// execute SQL
 	ret, err := f()
 	if err != nil {
-		// XA End & Rollback
+		// XA End & Rollback - mark as rolled back to prevent double rollback in defer
+		c.rollBacked = true
 		if rollbackErr := c.Rollback(ctx); rollbackErr != nil {
 			log.Errorf("failed to rollback xa branch of :%s, err:%v", c.txCtx.XID, rollbackErr)
 		}
@@ -293,6 +285,40 @@ func (c *XAConn) cleanXABranchContext() {
 	if !c.isConnKept {
 		c.xaBranchXid = nil
 	}
+}
+
+// handlePanicCleanup handles cleanup when an error or panic occurs during XA transaction execution.
+// This method performs XA cleanup if XA resource is initialized, regardless of xaActive flag.
+// This handles panics that occur between xaResource.Start() and xaActive = true.
+func (c *XAConn) handlePanicCleanup(ctx context.Context, err error, recoverErr interface{}) {
+	if err == nil && recoverErr == nil {
+		return
+	}
+
+	log.Errorf("conn at rollback  error:%v or recoverErr:%v", err, recoverErr)
+
+	// Perform XA cleanup if XA resource is initialized
+	if c.xaResource != nil && c.xaBranchXid != nil {
+		// End the XA branch with TMFail
+		if endErr := c.xaResource.End(ctx, c.xaBranchXid.String(), xa.TMFail); endErr != nil {
+			log.Errorf("failed to end xa branch in panic path, xid:%s, err:%v", c.txCtx.XID, endErr)
+		}
+		// Perform XA rollback
+		if rbErr := c.xaResource.Rollback(ctx, c.xaBranchXid.String()); rbErr != nil {
+			log.Errorf("failed to rollback xa branch in panic path, xid:%s, err:%v", c.txCtx.XID, rbErr)
+		}
+	}
+
+	// Rollback local transaction
+	if c.tx != nil && !c.rollBacked {
+		if rollbackErr := c.tx.Rollback(); rollbackErr != nil {
+			log.Errorf("conn at rollback error:%v", rollbackErr)
+		}
+	}
+
+	// Clean up and release resources
+	c.cleanXABranchContext()
+	c.releaseIfNecessary()
 }
 
 func (c *XAConn) Rollback(ctx context.Context) error {
@@ -405,6 +431,8 @@ func (c *XAConn) CloseForce() error {
 
 func (c *XAConn) XaCommit(ctx context.Context, xaXid XAXid) error {
 	err := c.xaResource.Commit(ctx, xaXid.String(), false)
+	// Clean up registration after phase 2 commit
+	c.res.UnregisterXABranch(xaXid.String())
 	c.releaseIfNecessary()
 	return err
 }
@@ -415,6 +443,8 @@ func (c *XAConn) XaRollbackByBranchId(ctx context.Context, xaXid XAXid) error {
 
 func (c *XAConn) XaRollback(ctx context.Context, xaXid XAXid) error {
 	err := c.xaResource.Rollback(ctx, xaXid.String())
+	// Clean up registration after phase 2 rollback
+	c.res.UnregisterXABranch(xaXid.String())
 	c.releaseIfNecessary()
 	return err
 }

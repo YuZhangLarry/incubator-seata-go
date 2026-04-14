@@ -136,6 +136,13 @@ func TestBuildExecutor(t *testing.T) {
 			wantErr:         false,
 		},
 		{
+			name:            "build executor for XA mode",
+			dbType:          types.DBTypeMySQL,
+			transactionMode: types.XAMode,
+			query:           "SELECT * FROM users WHERE name = 'Alice'",
+			wantErr:         false,
+		},
+		{
 			name:            "invalid SQL query",
 			dbType:          types.DBTypeMySQL,
 			transactionMode: types.ATMode,
