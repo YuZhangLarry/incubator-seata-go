@@ -142,6 +142,27 @@ func TestBuildExecutor(t *testing.T) {
 			query:           "INVALID SQL QUERY",
 			wantErr:         true,
 		},
+		{
+			name:            "build executor for XA mode",
+			dbType:          types.DBTypeMySQL,
+			transactionMode: types.XAMode,
+			query:           "SELECT * FROM users WHERE name = 'Alice'",
+			wantErr:         false,
+		},
+		{
+			name:            "build executor for XA mode with INSERT",
+			dbType:          types.DBTypeMySQL,
+			transactionMode: types.XAMode,
+			query:           "INSERT INTO users (name, age) VALUES ('Bob', 25)",
+			wantErr:         false,
+		},
+		{
+			name:            "build executor for XA mode with UPDATE",
+			dbType:          types.DBTypeMySQL,
+			transactionMode: types.XAMode,
+			query:           "UPDATE users SET age = 26 WHERE name = 'Bob'",
+			wantErr:         false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -153,9 +174,16 @@ func TestBuildExecutor(t *testing.T) {
 			} else {
 				assert.NoError(t, err, "should not return error for valid query")
 				assert.NotNil(t, executor, "executor should not be nil")
-				// Verify that the mock executor received the interceptors
-				assert.True(t, mockExecutor.interceptorsCalled, "Interceptors should be called")
-				assert.NotEmpty(t, mockExecutor.hooks, "hooks should be set")
+
+				// For AT mode, verify that the AT executor received the interceptors
+				if tt.transactionMode == types.ATMode {
+					assert.True(t, mockExecutor.interceptorsCalled, "Interceptors should be called for AT mode")
+					assert.NotEmpty(t, mockExecutor.hooks, "hooks should be set for AT mode")
+				}
+				// For XA mode, verify that a BaseExecutor is returned
+				if tt.transactionMode == types.XAMode {
+					assert.IsType(t, &BaseExecutor{}, executor, "XA mode should return BaseExecutor")
+				}
 			}
 		})
 	}
