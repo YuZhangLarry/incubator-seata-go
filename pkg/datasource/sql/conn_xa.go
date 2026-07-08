@@ -213,13 +213,20 @@ func (c *XAConn) createNewTxOnExecIfNeed(ctx context.Context, f func() (types.Ex
 		isErrSkip := err != nil && errors.Is(err, driver.ErrSkip)
 
 		if (err != nil && !isErrSkip) || recoverErr != nil {
-			// For XA transactions, use the connection's rollback which handles XA END + ROLLBACK
-			if !xaRollbacked && c.xaActive {
-				rollbackErr := c.Rollback(ctx)
-				if rollbackErr != nil {
-					log.Errorf("defer rollback xa branch error:%v", rollbackErr)
+			// Prefer XATx.Rollback so a registered branch reports phase-1 failure to
+			// the TC; fall back to the raw connection rollback for non-autoCommit paths.
+			if !xaRollbacked {
+				if tx != nil {
+					if rollbackErr := tx.Rollback(); rollbackErr != nil {
+						log.Errorf("defer rollback xa branch error:%v", rollbackErr)
+					}
+					xaRollbacked = true
+				} else if c.xaActive {
+					if rollbackErr := c.Rollback(ctx); rollbackErr != nil {
+						log.Errorf("defer rollback xa branch error:%v", rollbackErr)
+					}
+					xaRollbacked = true
 				}
-				xaRollbacked = true
 			}
 		}
 	}()
@@ -244,8 +251,14 @@ func (c *XAConn) createNewTxOnExecIfNeed(ctx context.Context, f func() (types.Ex
 		if isErrSkip {
 			return nil, err
 		}
-		// On real error, rollback the entire branch
-		if c.xaActive {
+		// On real error, rollback the entire branch. Prefer XATx.Rollback so the
+		// already-registered branch reports phase-1 failure to the TC; fall back to
+		// the raw connection rollback for non-autoCommit paths.
+		if tx != nil {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil {
+				log.Errorf("failed to rollback xa branch of :%s, err:%v", c.txCtx.XID, rollbackErr)
+			}
+		} else if c.xaActive {
 			if rollbackErr := c.Rollback(ctx); rollbackErr != nil {
 				log.Errorf("failed to rollback xa branch of :%s, err:%v", c.txCtx.XID, rollbackErr)
 			}
