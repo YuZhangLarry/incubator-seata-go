@@ -132,8 +132,6 @@ func (c *XAConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx,
 		return tx, err
 	}
 
-	// Save the original autoCommit state before modifying it
-	wasAutoCommit := c.autoCommit
 	c.autoCommit = false
 
 	c.txCtx = types.NewTxCtx()
@@ -142,9 +140,6 @@ func (c *XAConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx,
 	c.txCtx.ResourceID = c.res.resourceID
 	c.txCtx.XID = tm.GetXID(ctx)
 	c.txCtx.TransactionMode = types.XAMode
-	// Store the original autoCommit state for later use in commit logic
-	// If true, this XA branch supports multiple SQL statements (autoCommit mode)
-	c.txCtx.IsAutoCommitXABranch = wasAutoCommit
 
 	// Keep a sentinel target in Tx so any accidental fallback to the generic
 	// driver.Tx path fails fast instead of silently masking XA lifecycle bugs.
@@ -161,8 +156,6 @@ func (c *XAConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx,
 		return nil, err
 	}
 
-	// Create XA branch for both explicit transactions and autoCommit mode (branch reuse)
-	// In autoCommit mode, we register the branch but keep it open for multiple SQL statements
 	if c.xaActive {
 		return nil, errors.New("should NEVER happen: setAutoCommit from true to false while xa branch is active")
 	}
@@ -183,15 +176,11 @@ func (c *XAConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx,
 	c.xaBranchXid = XaIdBuild(c.txCtx.XID, c.txCtx.BranchID)
 	c.keepIfNecessary()
 
-	// For autoCommit mode (branch reuse), skip XA START here
-	// It will be done when needed for the actual execution
-	if !wasAutoCommit {
-		if err = c.start(ctx); err != nil {
-			c.cleanXABranchContext()
-			return nil, fmt.Errorf("failed to start xa branch xid:%s err:%w", c.txCtx.XID, err)
-		}
-		c.xaActive = true
+	if err = c.start(ctx); err != nil {
+		c.cleanXABranchContext()
+		return nil, fmt.Errorf("failed to start xa branch xid:%s err:%w", c.txCtx.XID, err)
 	}
+	c.xaActive = true
 
 	return &XATx{tx: tx.(*Tx)}, nil
 }
@@ -205,7 +194,7 @@ func (c *XAConn) createOnceTxContext(ctx context.Context) bool {
 		c.txCtx.ResourceID = c.res.resourceID
 		c.txCtx.XID = tm.GetXID(ctx)
 		c.txCtx.TransactionMode = types.XAMode
-		c.txCtx.IsAutoCommitXABranch = true
+		c.txCtx.GlobalLockRequire = true
 	}
 
 	return onceTx
@@ -217,8 +206,6 @@ func (c *XAConn) createNewTxOnExecIfNeed(ctx context.Context, f func() (types.Ex
 		err          error
 		xaRollbacked bool // Track if XA rollback was already done to avoid duplicate rollback
 	)
-
-	xid := tm.GetXID(ctx)
 
 	defer func() {
 		recoverErr := recover()
@@ -239,28 +226,11 @@ func (c *XAConn) createNewTxOnExecIfNeed(ctx context.Context, f func() (types.Ex
 
 	currentAutoCommit := c.autoCommit
 
-	// For global transactions in autoCommit mode, create/reuse XA branch
+	// For global transactions in autoCommit mode, each statement is a complete XA branch
 	if c.txCtx.TransactionMode != types.Local && tm.IsGlobalTx(ctx) && c.autoCommit {
-		// Check if we already have an active XA branch for this transaction
-		heldConn := c.res.GetXABranch(xid)
-		if heldConn != nil && heldConn.xaActive && heldConn.txCtx.XID == xid {
-			if heldConn != c {
-				// Delegate to the connection that holds the XA branch
-				return heldConn.createNewTxOnExecIfNeed(ctx, f)
-			}
-			// Current connection already has the XA branch, execute SQL directly
-			// Skip creating a new branch
-		} else {
-			// Create new XA branch
-			tx, err = c.BeginTx(ctx, driver.TxOptions{Isolation: driver.IsolationLevel(gosql.LevelDefault)})
-			if err != nil {
-				return nil, err
-			}
-
-			// Register the XA branch in the resource holder for reuse by subsequent SQL statements
-			if c.xaBranchXid != nil {
-				c.res.RegisterXABranch(xid, c)
-			}
+		tx, err = c.BeginTx(ctx, driver.TxOptions{Isolation: driver.IsolationLevel(gosql.LevelDefault)})
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -284,9 +254,8 @@ func (c *XAConn) createNewTxOnExecIfNeed(ctx context.Context, f func() (types.Ex
 		return nil, err
 	}
 
-	// For autoCommit mode with global transaction, call Commit()
-	// The Commit method will skip actual XA END/PREPARE if IsAutoCommitXABranch is true
-	// This allows multiple SQL statements to use the same XA branch
+	// For autoCommit mode with global transaction, commit the branch now:
+	// XA END + XA PREPARE + report phase-1 success to TC.
 	if tx != nil && currentAutoCommit {
 		if err = tx.Commit(); err != nil {
 			log.Errorf("xa transaction commit failure xid:%s, err:%v", c.txCtx.XID, err)
@@ -331,13 +300,6 @@ func (c *XAConn) start(ctx context.Context) error {
 		return fmt.Errorf("xa xid %s resource connection start err:%w", c.txCtx.XID, err)
 	}
 
-	// For multi-statement XA transactions (originally in autoCommit mode),
-	// skip the termination check. The check will be done during Phase 2 commit/rollback.
-	if c.txCtx.IsAutoCommitXABranch {
-		return nil
-	}
-
-	// For explicit transactions (BeginTx mode), do the normal termination check
 	if err := c.termination(c.xaBranchXid.String()); err != nil {
 		c.xaResource.End(ctx, c.xaBranchXid.String(), xa.TMFail)
 		c.XaRollback(ctx, c.xaBranchXid)
@@ -378,8 +340,7 @@ func (c *XAConn) cleanXABranchContext() {
 }
 
 func (c *XAConn) Rollback(ctx context.Context) error {
-	// For autoCommit mode (multi-statement transactions), check if rollback is needed
-	if c.autoCommit && !c.xaActive {
+	if c.autoCommit {
 		return nil
 	}
 
@@ -408,9 +369,6 @@ func (c *XAConn) Rollback(ctx context.Context) error {
 	}
 	c.cleanXABranchContext()
 
-	// Clean up resource holder on rollback
-	c.res.UnregisterXABranch(c.txCtx.XID)
-
 	return nil
 }
 
@@ -419,12 +377,6 @@ func (c *XAConn) rollbackErrorHandle() error {
 }
 
 func (c *XAConn) Commit(ctx context.Context) error {
-	// If this XA branch was created in autoCommit mode (multi-statement transaction),
-	// don't do the actual XA commit here. The TC will handle it in Phase 2.
-	if c.txCtx.IsAutoCommitXABranch {
-		return nil
-	}
-
 	if c.autoCommit {
 		return nil
 	}
@@ -448,14 +400,6 @@ func (c *XAConn) Commit(ctx context.Context) error {
 	}
 
 	c.prepareTime = time.Now()
-
-	// Update registry state to PREPARED and unregister
-	registry := getXARegistry()
-	registry.setState(c.txCtx.XID, xaStatePrepared)
-	registry.unregister(c.txCtx.XID)
-
-	// Unregister from resource holder after successful prepare
-	c.res.UnregisterXABranch(c.txCtx.XID)
 
 	return nil
 }

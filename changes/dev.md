@@ -26,7 +26,7 @@
 ### feature：
 
   - [[#123](https://github.com/apache/incubator-seata-go/pull/123)] add two phase and dubbo
-  - support XA branch reuse in autoCommit mode
+  - support XA branch enrollment for autoCommit statements in global transaction
   - support PostgreSQL XA via pgx driver
   - [[#1130](https://github.com/apache/incubator-seata-go/issues/1130)] support MySQL multi-value INSERT in AT mode for composite and mixed primary keys
 

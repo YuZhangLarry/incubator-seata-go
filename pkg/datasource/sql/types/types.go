@@ -149,9 +149,6 @@ type TransactionContext struct {
 	XID string
 	// GlobalLockRequire indicates whether global lock is required (used in AT mode)
 	GlobalLockRequire bool
-	// IsAutoCommitXABranch indicates whether the XA branch was created in autoCommit mode
-	// for multi-statement transaction support
-	IsAutoCommitXABranch bool
 	// RoundImages when run in AT mode, record before and after Row image
 	RoundImages *RoundRecordImage
 	// LocalTx local transaction instance, managed by at connection
