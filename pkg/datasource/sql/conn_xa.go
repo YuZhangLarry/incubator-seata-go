@@ -244,11 +244,23 @@ func (c *XAConn) createNewTxOnExecIfNeed(ctx context.Context, f func() (types.Ex
 	// execute SQL
 	ret, err := f()
 	if err != nil {
-		// Check if this is driver.ErrSkip - not a real error, just means use fallback path
-		// In this case, don't rollback the XA branch, just return the error
-		// The database/sql package will handle the retry
-		isErrSkip := errors.Is(err, driver.ErrSkip)
-		if isErrSkip {
+		// driver.ErrSkip is not a real failure: it asks database/sql to retry this
+		// statement through the Prepare+Exec fallback path.
+		if errors.Is(err, driver.ErrSkip) {
+			// If we already opened an XA branch for this statement (autoCommit mode),
+			// the fallback retry would run OUTSIDE the branch - autoCommit is now false
+			// and txCtx has been reset - leaving this branch registered-but-never-
+			// prepared (a leak) and the retried write escaping the global transaction.
+			// Roll the branch back and surface a real (non-ErrSkip) error so the caller
+			// fails fast instead of silently corrupting the global transaction.
+			if tx != nil {
+				if rollbackErr := tx.Rollback(); rollbackErr != nil {
+					log.Errorf("failed to rollback xa branch of :%s after ErrSkip, err:%v", c.txCtx.XID, rollbackErr)
+				}
+				xaRollbacked = true
+				return nil, fmt.Errorf("xa branch %s cannot fall back to non-XA execution after XA START: %v", c.txCtx.XID, err)
+			}
+			// No branch opened yet - safe to let database/sql use its fallback path.
 			return nil, err
 		}
 		// On real error, rollback the entire branch. Prefer XATx.Rollback so the
