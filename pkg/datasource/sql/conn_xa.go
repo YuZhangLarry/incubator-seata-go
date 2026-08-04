@@ -90,7 +90,7 @@ func (c *XAConn) QueryContext(ctx context.Context, query string, args []driver.N
 		}()
 	}
 
-	ret, err := c.createNewTxOnExecIfNeed(ctx, func() (types.ExecResult, error) {
+	ret, err := c.createNewTxOnExecIfNeed(ctx, true, func() (types.ExecResult, error) {
 		ret, err := c.Conn.QueryContext(ctx, query, args)
 		if err != nil {
 			return nil, err
@@ -110,7 +110,7 @@ func (c *XAConn) ExecContext(ctx context.Context, query string, args []driver.Na
 		}()
 	}
 
-	ret, err := c.createNewTxOnExecIfNeed(ctx, func() (types.ExecResult, error) {
+	ret, err := c.createNewTxOnExecIfNeed(ctx, false, func() (types.ExecResult, error) {
 		ret, err := c.Conn.ExecContext(ctx, query, args)
 		if err != nil {
 			return nil, err
@@ -200,7 +200,7 @@ func (c *XAConn) createOnceTxContext(ctx context.Context) bool {
 	return onceTx
 }
 
-func (c *XAConn) createNewTxOnExecIfNeed(ctx context.Context, f func() (types.ExecResult, error)) (types.ExecResult, error) {
+func (c *XAConn) createNewTxOnExecIfNeed(ctx context.Context, isQuery bool, f func() (types.ExecResult, error)) (types.ExecResult, error) {
 	var (
 		tx           driver.Tx
 		err          error
@@ -282,6 +282,26 @@ func (c *XAConn) createNewTxOnExecIfNeed(ctx context.Context, f func() (types.Ex
 	// For autoCommit mode with global transaction, commit the branch now:
 	// XA END + XA PREPARE + report phase-1 success to TC.
 	if tx != nil && currentAutoCommit {
+		// A query statement returns an open result set that still occupies this
+		// connection's read buffer. Running XA END + XA PREPARE here - before the
+		// caller has drained/closed the rows - issues a new command on top of that
+		// unread result set, which go-sql-driver rejects as a "busy buffer" /
+		// "commands out of sync" error and database/sql surfaces as
+		// "driver: bad connection", forcing the whole transaction to roll back
+		// (issue #904, e.g. SELECT ... FOR UPDATE followed by UPDATE). Defer the
+		// branch commit until the caller closes the rows, mirroring AT mode's
+		// RowsCommitOnClose handling. xaDeferredCommitTx keeps the inline path's
+		// rollback-on-commit-failure semantics so a failed deferred commit never
+		// leaves a prepared branch holding locks. (GetRows must only be called on
+		// a query result - it panics on a write result - hence the isQuery gate.)
+		if isQuery {
+			if dr := ret.GetRows(); dr != nil {
+				return types.NewResult(types.WithRows(&RowsCommitOnClose{
+					rows: dr,
+					tx:   xaDeferredCommitTx{tx: tx},
+				})), nil
+			}
+		}
 		if err = tx.Commit(); err != nil {
 			log.Errorf("xa transaction commit failure xid:%s, err:%v", c.txCtx.XID, err)
 			// XA End & Rollback
@@ -294,6 +314,43 @@ func (c *XAConn) createNewTxOnExecIfNeed(ctx context.Context, f func() (types.Ex
 	}
 
 	return ret, nil
+}
+
+// xaDeferredCommitTx wraps an XA branch tx whose commit is deferred until the
+// query's rows are closed (see createNewTxOnExecIfNeed / RowsCommitOnClose).
+// It mirrors the inline exec path: if the deferred XA END + XA PREPARE (or the
+// phase-1 report to the TC) fails, the branch is rolled back so it does not stay
+// prepared and hold locks.
+type xaDeferredCommitTx struct {
+	tx driver.Tx
+}
+
+func (t xaDeferredCommitTx) Commit() error {
+	if err := t.tx.Commit(); err != nil {
+		log.Errorf("deferred xa branch commit failed, rolling back branch: %v", err)
+		if rollbackErr := t.tx.Rollback(); rollbackErr != nil {
+			log.Errorf("deferred xa branch rollback failed: %v", rollbackErr)
+		}
+		return err
+	}
+	return nil
+}
+
+func (t xaDeferredCommitTx) Rollback() error {
+	return t.tx.Rollback()
+}
+
+// ResetSession is called by database/sql before reusing a pooled connection.
+// XAConn.xaActive lives on the XA wrapper, so the embedded *Conn.ResetSession
+// cannot clear it; without this override a connection whose previous autoCommit
+// branch already completed phase-1 would keep xaActive=true and the next
+// statement's BeginTx would fail the "xa branch is active" guard. Clearing it
+// here (in addition to XAConn.Commit) is a defensive backstop for any path that
+// leaves a stale flag. xaBranchXid is intentionally left untouched so a held
+// branch remains available for phase-2.
+func (c *XAConn) ResetSession(ctx context.Context) error {
+	c.xaActive = false
+	return c.Conn.ResetSession(ctx)
 }
 
 func (c *XAConn) keepIfNecessary() {
@@ -425,6 +482,15 @@ func (c *XAConn) Commit(ctx context.Context) error {
 	}
 
 	c.prepareTime = time.Now()
+
+	// Phase-1 is done: this session no longer has an in-flight XA branch. Clear
+	// only the session-active flag so a subsequent autoCommit statement on the
+	// same (possibly pooled/reused) connection can open a fresh branch instead of
+	// tripping the "xa branch is active" guard in BeginTx. The branch itself is
+	// still prepared and, when held, retrievable for phase-2 via xaBranchXid, so
+	// we must NOT call cleanXABranchContext here (that would reset prepareTime and
+	// drop xaBranchXid). Phase-2 XaCommit/XaRollback do not depend on xaActive.
+	c.xaActive = false
 
 	return nil
 }

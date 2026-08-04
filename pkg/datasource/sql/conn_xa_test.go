@@ -53,8 +53,7 @@ func (m *mysqlMockRows) Columns() []string {
 }
 
 func (m *mysqlMockRows) Close() error {
-	//TODO implement me
-	panic("implement me")
+	return nil
 }
 
 func (m *mysqlMockRows) Next(dest []driver.Value) error {
@@ -377,6 +376,14 @@ func TestXAConn_Rollback_XAER_RMFAIL(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "matching XAER_RMFAIL error with PREPARED state",
+			err: &mysql.MySQLError{
+				Number:  1399,
+				Message: "Error 1399 (XAE07): XAER_RMFAIL: The command cannot be executed when global transaction is in the PREPARED state",
+			},
+			want: true,
+		},
+		{
 			name: "matching XAER_RMFAIL error with already ended",
 			err: &mysql.MySQLError{
 				Number:  1399,
@@ -447,6 +454,51 @@ func TestXAConn_Rollback_HandleXAERRMFAILAlreadyEnded(t *testing.T) {
 	}
 }
 
+// Reproduces the review scenario where the branch is already PREPARED when Rollback runs:
+// during autoCommit Commit the DB executed XA END + XA PREPARE, but the phase-1 report to
+// the TC failed, so the branch is left in the PREPARED state. The follow-up rollback issues
+// XA END(TMFAIL), which MySQL rejects with XAER_RMFAIL "...PREPARED state". Before the fix
+// IsAlreadyEnded only recognized the IDLE-state message, so Rollback bailed out via
+// rollbackErrorHandle() BEFORE running XA ROLLBACK, leaving the branch holding locks forever.
+// This asserts XA ROLLBACK is still issued so the prepared branch releases its locks.
+func TestXAConn_Rollback_PreparedBranchStillRollsBack(t *testing.T) {
+	ctrl, db, _, _ := initXAConnTestResource(t)
+	defer func() {
+		simulateExecContextError = nil
+		db.Close()
+		ctrl.Finish()
+		CleanTxHooks()
+	}()
+
+	ctx := tm.InitSeataContext(context.Background())
+	tm.SetXID(ctx, uuid.New().String())
+
+	var rollbackSeen int32
+	// Inject: XA END returns XAER_RMFAIL with the PREPARED-state message; user SQL fails to
+	// trigger the rollback path; record whether XA ROLLBACK is subsequently issued.
+	simulateExecContextError = func(query string) error {
+		upper := strings.ToUpper(strings.TrimSpace(query))
+		switch {
+		case strings.HasPrefix(upper, "XA END"):
+			return &mysql.MySQLError{
+				Number:  types.ErrCodeXAER_RMFAIL_IDLE,
+				Message: "Error 1399 (XAE07): XAER_RMFAIL: The command cannot be executed when global transaction is in the PREPARED state",
+			}
+		case strings.HasPrefix(upper, "XA ROLLBACK"):
+			atomic.StoreInt32(&rollbackSeen, 1)
+			return nil
+		case !strings.HasPrefix(upper, "XA "):
+			return io.EOF
+		}
+		return nil
+	}
+
+	_, err := db.ExecContext(ctx, "UPDATE user SET age = 1 WHERE id = 1")
+	assert.Error(t, err, "expected error to trigger rollback path")
+	assert.Equal(t, int32(1), atomic.LoadInt32(&rollbackSeen),
+		"XA ROLLBACK must run so a PREPARED branch releases its locks")
+}
+
 func TestXAConn_ExecContext_AutoCommitReportsPhaseOneDone(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -477,6 +529,134 @@ func TestXAConn_ExecContext_AutoCommitReportsPhaseOneDone(t *testing.T) {
 	_, err := xaConn.ExecContext(ctx, "SELECT 1", nil)
 	assert.NoError(t, err)
 	assert.Equal(t, int32(1), atomic.LoadInt32(&commitCnt))
+}
+
+// Regression for the autoCommit branch-reuse bug: after a statement's XA branch
+// completes phase-1 (XA END + XA PREPARE + report), the session must no longer be
+// marked as having an active branch, otherwise the next autoCommit statement on the
+// SAME physical connection (which database/sql reuses via the pool, calling
+// ResetSession in between) trips BeginTx's "should NEVER happen: setAutoCommit from
+// true to false while xa branch is active" guard. Before the fix, XAConn.Commit's
+// success path never cleared xaActive (only the rollback/cleanup path did) and
+// ResetSession - living on the embedded *Conn - could not reach it, so the second
+// statement always failed.
+func TestXAConn_ExecContext_ReuseAfterAutoCommitBranch(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	CleanTxHooks()
+	defer CleanTxHooks()
+
+	// XAConn.Commit -> checkTimeout compares branchRegisterTime against xaConnTimeout,
+	// which is 0 unless InitXA runs. Give the branch a real budget so phase-1 prepares.
+	prevTimeout := xaConnTimeout
+	xaConnTimeout = time.Minute
+	defer func() { xaConnTimeout = prevTimeout }()
+
+	xaConn, mockMgr := newMockXAConn(t, ctrl, 123)
+	mockMgr.EXPECT().BranchReport(gomock.Any(), gomock.Any()).AnyTimes().Return(nil)
+
+	var commitCnt int32
+	RegisterTxHook(&mockTxHook{
+		beforeCommit: func(tx *Tx) error {
+			atomic.AddInt32(&commitCnt, 1)
+			return nil
+		},
+	})
+
+	ctx := tm.InitSeataContext(context.Background())
+	tm.SetXID(ctx, uuid.NewString())
+
+	// First autoCommit statement: opens and completes a full XA branch.
+	_, err := xaConn.ExecContext(ctx, "SELECT 1", nil)
+	assert.NoError(t, err)
+	// The Commit success path must clear the session-active flag on its own, so the
+	// fix holds even for paths where database/sql does not call ResetSession.
+	assert.False(t, xaConn.xaActive, "xaActive must be cleared after phase-1 completes")
+
+	// Simulate database/sql returning the connection to the pool and reusing it:
+	// ResetSession restores autoCommit=true (and, via the XAConn override, clears the
+	// XA session flag as a backstop).
+	assert.NoError(t, xaConn.ResetSession(ctx))
+	assert.True(t, xaConn.autoCommit, "ResetSession must restore autoCommit for pooled reuse")
+	assert.False(t, xaConn.xaActive, "ResetSession must leave no active XA branch")
+
+	// Second autoCommit statement on the SAME XAConn must open a fresh branch instead
+	// of failing the "xa branch is active" guard.
+	_, err = xaConn.ExecContext(ctx, "SELECT 2", nil)
+	assert.NoError(t, err, "second autoCommit statement on a reused XAConn must succeed")
+
+	assert.Equal(t, int32(2), atomic.LoadInt32(&commitCnt))
+}
+
+// Reproduces the #904 "busy buffer" scenario on the query path: a SELECT ... FOR
+// UPDATE opens a result set that still occupies the connection's read buffer. If the
+// autoCommit branch were committed inline (XA END + XA PREPARE) while those rows are
+// open, go-sql-driver would reject the new command with a "busy buffer" /
+// "commands out of sync" error surfacing as "driver: bad connection". This asserts the
+// branch commit is deferred: XA END / XA PREPARE / the phase-1 report only run once the
+// caller closes the rows, so the busy-buffer collision never happens.
+func TestXAConn_QueryContext_DefersBranchCommitUntilRowsClose(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	CleanTxHooks()
+	defer func() {
+		simulateExecContextError = nil
+		CleanTxHooks()
+	}()
+
+	// checkTimeout compares against xaConnTimeout, which is only set by InitXA in a
+	// running server. Give the branch a real budget so the deferred commit prepares
+	// instead of aborting as timed-out.
+	prevTimeout := xaConnTimeout
+	xaConnTimeout = time.Minute
+	defer func() { xaConnTimeout = prevTimeout }()
+
+	xaConn, mockMgr := newMockXAConn(t, ctrl, 123)
+
+	var reported int32
+	mockMgr.EXPECT().BranchReport(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(ctx context.Context, param rm.BranchReportParam) error {
+			assert.EqualValues(t, branch.BranchStatusPhaseoneDone, param.Status)
+			atomic.StoreInt32(&reported, 1)
+			return nil
+		},
+	).Times(1)
+
+	// Record when the branch-commit statements run on the physical connection.
+	var endSeen, prepareSeen int32
+	simulateExecContextError = func(query string) error {
+		upper := strings.ToUpper(strings.TrimSpace(query))
+		switch {
+		case strings.HasPrefix(upper, "XA END"):
+			atomic.StoreInt32(&endSeen, 1)
+		case strings.HasPrefix(upper, "XA PREPARE"):
+			atomic.StoreInt32(&prepareSeen, 1)
+		}
+		return nil
+	}
+
+	ctx := tm.InitSeataContext(context.Background())
+	tm.SetXID(ctx, uuid.NewString())
+
+	rows, err := xaConn.QueryContext(ctx, "SELECT * FROM user WHERE id = 1 FOR UPDATE", nil)
+	assert.NoError(t, err)
+
+	// While the result set is still open, the branch must NOT have been committed -
+	// issuing XA END / XA PREPARE here is exactly the #904 busy-buffer trigger.
+	assert.Equal(t, int32(0), atomic.LoadInt32(&endSeen), "XA END must be deferred until rows close")
+	assert.Equal(t, int32(0), atomic.LoadInt32(&prepareSeen), "XA PREPARE must be deferred until rows close")
+	assert.Equal(t, int32(0), atomic.LoadInt32(&reported), "phase-1 report must be deferred until rows close")
+
+	// The returned rows must be the deferred-commit wrapper.
+	_, ok := rows.(*RowsCommitOnClose)
+	assert.True(t, ok, "XA query rows must be wrapped in RowsCommitOnClose to defer the branch commit")
+
+	// Closing the rows drains the connection first, then runs XA END + XA PREPARE + report.
+	assert.NoError(t, rows.Close())
+
+	assert.Equal(t, int32(1), atomic.LoadInt32(&endSeen), "XA END must run once rows are closed")
+	assert.Equal(t, int32(1), atomic.LoadInt32(&prepareSeen), "XA PREPARE must run once rows are closed")
+	assert.Equal(t, int32(1), atomic.LoadInt32(&reported), "phase-1 report must run once rows are closed")
 }
 
 func TestXAConn_BeginTx_DoesNotStartPhysicalTx(t *testing.T) {
