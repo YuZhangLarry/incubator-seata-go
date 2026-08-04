@@ -149,7 +149,7 @@ func (e *BaseExecutor) ExecWithValue(ctx context.Context, execCtx *types.ExecCon
 		return e.ex.ExecWithValue(ctx, execCtx, f)
 	}
 
-	nvargs := make([]driver.NamedValue, len(execCtx.Values))
+	nvargs := make([]driver.NamedValue, 0, len(execCtx.Values))
 	for i, value := range execCtx.Values {
 		nvargs = append(nvargs, driver.NamedValue{
 			Value:   value,
