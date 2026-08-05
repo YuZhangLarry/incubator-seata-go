@@ -416,6 +416,9 @@ func (c *XAConn) ResetSession(ctx context.Context) error {
 }
 
 func (c *XAConn) keepIfNecessary() {
+	if c.xaBranchXid == nil {
+		return
+	}
 	if c.ShouldBeHeld() {
 		if err := c.res.Hold(c.xaBranchXid.String(), c); err == nil {
 			c.isConnKept = true
@@ -424,6 +427,14 @@ func (c *XAConn) keepIfNecessary() {
 }
 
 func (c *XAConn) releaseIfNecessary() {
+	// cleanXABranchContext nils xaBranchXid once a branch is no longer kept, and
+	// the two-phase timeout checker force-closes committed connections after the
+	// hold time elapses. Guard against the nil branch xid so that sweep (which
+	// calls CloseForce -> cleanXABranchContext -> releaseIfNecessary) does not
+	// dereference a nil *XABranchXid via String().
+	if c.xaBranchXid == nil {
+		return
+	}
 	if c.ShouldBeHeld() && c.xaBranchXid.String() != "" {
 		if c.isConnKept {
 			c.res.Release(c.xaBranchXid.String())
