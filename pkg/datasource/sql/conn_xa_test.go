@@ -659,6 +659,78 @@ func TestXAConn_QueryContext_DefersBranchCommitUntilRowsClose(t *testing.T) {
 	assert.Equal(t, int32(1), atomic.LoadInt32(&reported), "phase-1 report must run once rows are closed")
 }
 
+// End-to-end regression for the exact #904 sequence: under an autoCommit global
+// transaction, a "SELECT ... FOR UPDATE" is immediately followed by an "UPDATE" on the
+// SAME physical connection. The SELECT's open result set occupies the connection's read
+// buffer; the busy-buffer error struck because the first branch used to be committed
+// inline (XA END + XA PREPARE) while those rows were still open, then the second
+// statement could not open its own branch. This drives the full flow - query, drain,
+// commit branch 1, pool reuse (ResetSession), then the UPDATE as branch 2 - and asserts
+// each statement forms its own complete branch (two XA END + XA PREPARE + phase-1
+// reports) with no error, so the busy-buffer collision cannot recur.
+func TestXAConn_AutoCommit_SelectForUpdateThenUpdate(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	CleanTxHooks()
+	defer func() {
+		simulateExecContextError = nil
+		CleanTxHooks()
+	}()
+
+	prevTimeout := xaConnTimeout
+	xaConnTimeout = time.Minute
+	defer func() { xaConnTimeout = prevTimeout }()
+
+	xaConn, mockMgr := newMockXAConn(t, ctrl, 123)
+
+	var reportCnt int32
+	mockMgr.EXPECT().BranchReport(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(ctx context.Context, param rm.BranchReportParam) error {
+			assert.EqualValues(t, branch.BranchStatusPhaseoneDone, param.Status)
+			atomic.AddInt32(&reportCnt, 1)
+			return nil
+		},
+	).AnyTimes()
+
+	var endCnt, prepareCnt int32
+	simulateExecContextError = func(query string) error {
+		upper := strings.ToUpper(strings.TrimSpace(query))
+		switch {
+		case strings.HasPrefix(upper, "XA END"):
+			atomic.AddInt32(&endCnt, 1)
+		case strings.HasPrefix(upper, "XA PREPARE"):
+			atomic.AddInt32(&prepareCnt, 1)
+		}
+		return nil
+	}
+
+	ctx := tm.InitSeataContext(context.Background())
+	tm.SetXID(ctx, uuid.NewString())
+
+	// Statement 1: SELECT ... FOR UPDATE. The branch commit is deferred while the rows
+	// are open, so no XA END / XA PREPARE fires yet - that would be the busy-buffer bug.
+	rows, err := xaConn.QueryContext(ctx, "SELECT * FROM user WHERE id = 1 FOR UPDATE", nil)
+	assert.NoError(t, err)
+	assert.Equal(t, int32(0), atomic.LoadInt32(&endCnt), "branch 1 must not commit while its rows are open")
+
+	// Draining/closing the rows completes branch 1 (XA END + XA PREPARE + report).
+	assert.NoError(t, rows.Close())
+	assert.Equal(t, int32(1), atomic.LoadInt32(&endCnt), "branch 1 commits once its rows close")
+	assert.Equal(t, int32(1), atomic.LoadInt32(&prepareCnt))
+	assert.False(t, xaConn.xaActive, "branch 1 must leave no active branch on the session")
+
+	// database/sql returns the connection to the pool and resets it before reuse.
+	assert.NoError(t, xaConn.ResetSession(ctx))
+
+	// Statement 2: the follow-up UPDATE on the SAME connection must form its own branch.
+	_, err = xaConn.ExecContext(ctx, "UPDATE user SET age = age + 1 WHERE id = 1", nil)
+	assert.NoError(t, err, "UPDATE after SELECT ... FOR UPDATE must succeed (no busy buffer)")
+
+	assert.Equal(t, int32(2), atomic.LoadInt32(&endCnt), "each statement forms one complete XA branch")
+	assert.Equal(t, int32(2), atomic.LoadInt32(&prepareCnt))
+	assert.Equal(t, int32(2), atomic.LoadInt32(&reportCnt), "each branch reports phase-1 done to the TC")
+}
+
 func TestXAConn_BeginTx_DoesNotStartPhysicalTx(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()

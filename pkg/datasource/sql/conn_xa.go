@@ -253,6 +253,16 @@ func (c *XAConn) createNewTxOnExecIfNeed(ctx context.Context, isQuery bool, f fu
 			// prepared (a leak) and the retried write escaping the global transaction.
 			// Roll the branch back and surface a real (non-ErrSkip) error so the caller
 			// fails fast instead of silently corrupting the global transaction.
+			//
+			// TRADEOFF: because the branch is opened (BeginTx) BEFORE f() runs, any
+			// statement that legitimately needs the Prepare+Exec fallback - i.e. one the
+			// direct Execer/Queryer cannot handle and answers with driver.ErrSkip, such
+			// as certain named/typed argument forms - turns from "retryable" into a hard
+			// error under XA autoCommit + global transaction. Statements that never emit
+			// ErrSkip (the common case) are unaffected. A cleaner fix would open the XA
+			// branch lazily - probe/execute first and register the branch only after the
+			// direct path is confirmed - so ErrSkip can take the fallback without a branch
+			// to unwind; that reorders the XA lifecycle and is left as a follow-up.
 			if tx != nil {
 				if rollbackErr := tx.Rollback(); rollbackErr != nil {
 					log.Errorf("failed to rollback xa branch of :%s after ErrSkip, err:%v", c.txCtx.XID, rollbackErr)
