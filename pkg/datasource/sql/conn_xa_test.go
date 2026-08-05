@@ -106,6 +106,37 @@ func (mi *mockSQLInterceptor) After(ctx context.Context, execCtx *types.ExecCont
 // When set, baseMockConn will call this hook for each ExecContext.
 var simulateExecContextError func(query string) error
 
+// fakePreparedStmt models a driver prepared statement. It is what the driver
+// returns from PrepareContext, and its ExecContext/QueryContext ALWAYS succeed -
+// mirroring the real go-sql-driver, where the direct Execer answers driver.ErrSkip
+// for parameterized statements but the Prepare+Exec path executes fine. This lets
+// tests exercise XAConn's in-branch ErrSkip fallback (execPreparedInBranch /
+// queryPreparedInBranch).
+type fakePreparedStmt struct{}
+
+func (s *fakePreparedStmt) Close() error  { return nil }
+func (s *fakePreparedStmt) NumInput() int { return -1 }
+
+func (s *fakePreparedStmt) Exec(args []driver.Value) (driver.Result, error) {
+	return &driver.ResultNoRows, nil
+}
+
+func (s *fakePreparedStmt) Query(args []driver.Value) (driver.Rows, error) {
+	rows := &mysqlMockRows{}
+	rows.data = [][]interface{}{{"8.0.29"}}
+	return rows, nil
+}
+
+func (s *fakePreparedStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	return &driver.ResultNoRows, nil
+}
+
+func (s *fakePreparedStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	rows := &mysqlMockRows{}
+	rows.data = [][]interface{}{{"8.0.29"}}
+	return rows, nil
+}
+
 func baseMockConn(mockConn *mock.MockTestDriverConn) {
 	branchStatusCache = gcache.New(1024).LRU().Expiration(time.Minute * 10).Build()
 
@@ -122,6 +153,14 @@ func baseMockConn(mockConn *mock.MockTestDriverConn) {
 	mockConn.EXPECT().Exec(gomock.Any(), gomock.Any()).AnyTimes().Return(&driver.ResultNoRows, nil)
 	mockConn.EXPECT().ResetSession(gomock.Any()).AnyTimes().Return(nil)
 	mockConn.EXPECT().Close().AnyTimes().Return(nil)
+
+	// The Prepare+Exec fallback path (used when the direct ExecContext answers
+	// driver.ErrSkip) prepares on the same physical connection and runs the
+	// statement through the prepared stmt, which always succeeds.
+	mockConn.EXPECT().PrepareContext(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(
+		func(ctx context.Context, query string) (driver.Stmt, error) {
+			return &fakePreparedStmt{}, nil
+		})
 
 	mockConn.EXPECT().QueryContext(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(
 		func(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
@@ -729,6 +768,68 @@ func TestXAConn_AutoCommit_SelectForUpdateThenUpdate(t *testing.T) {
 	assert.Equal(t, int32(2), atomic.LoadInt32(&endCnt), "each statement forms one complete XA branch")
 	assert.Equal(t, int32(2), atomic.LoadInt32(&prepareCnt))
 	assert.Equal(t, int32(2), atomic.LoadInt32(&reportCnt), "each branch reports phase-1 done to the TC")
+}
+
+// ErrSkip in-branch fallback under XA autoCommit.
+//
+// go-sql-driver returns driver.ErrSkip from Exec/Query whenever a statement carries
+// bind arguments and the DSN does NOT set interpolateParams=true (the default). See
+// go-sql-driver/mysql@v1.6.0 connection.go: `if len(args) != 0 { if !cfg.InterpolateParams
+// { return nil, driver.ErrSkip } }`. database/sql normally answers ErrSkip by retrying the
+// statement through the Prepare+Exec path.
+//
+// Under XA autoCommit + a global transaction, createNewTxOnExecIfNeed opens the XA branch
+// (XA START) BEFORE running the statement, so it cannot hand the retry back to database/sql
+// (that retry would run on another connection, outside the branch). Instead XAConn runs the
+// Prepare+Exec fallback ITSELF on the same physical connection - which still holds XA START
+// open - so a perfectly ordinary parameterized statement (`UPDATE ... WHERE id = ?` with the
+// default MySQL DSN) completes inside the branch and the branch commits normally.
+//
+// The mock models the driver faithfully: the direct ExecContext answers ErrSkip for the
+// business UPDATE, while PrepareContext + the prepared stmt's ExecContext succeed.
+func TestXAConn_AutoCommit_ParameterizedStmtErrSkipFallsBackInBranch(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	CleanTxHooks()
+	defer func() {
+		simulateExecContextError = nil
+		CleanTxHooks()
+	}()
+
+	prevTimeout := xaConnTimeout
+	xaConnTimeout = time.Minute
+	defer func() { xaConnTimeout = prevTimeout }()
+
+	xaConn, mockMgr := newMockXAConn(t, ctrl, 123)
+	// The branch prepares and reports phase-1 success once the in-branch fallback succeeds.
+	var reportCnt int32
+	mockMgr.EXPECT().BranchReport(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(
+		func(_ context.Context, _ interface{}) error {
+			atomic.AddInt32(&reportCnt, 1)
+			return nil
+		})
+
+	// Model go-sql-driver's default behavior: a parameterized business statement answers
+	// ErrSkip on the direct Execer path; the XA control statements (XA START/END/PREPARE)
+	// succeed. PrepareContext + prepared ExecContext (wired in baseMockConn) succeed.
+	simulateExecContextError = func(query string) error {
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "UPDATE") {
+			return driver.ErrSkip
+		}
+		return nil
+	}
+
+	ctx := tm.InitSeataContext(context.Background())
+	tm.SetXID(ctx, uuid.NewString())
+
+	_, err := xaConn.ExecContext(ctx, "UPDATE user SET age = age + 1 WHERE id = ?",
+		[]driver.NamedValue{{Ordinal: 1, Value: int64(1)}})
+
+	// The fix: the parameterized UPDATE completes inside the branch via the in-branch
+	// Prepare+Exec fallback, and the branch commits (phase-1 reported to the TC).
+	assert.NoError(t, err, "parameterized UPDATE should complete via the in-branch Prepare+Exec fallback")
+	assert.Equal(t, int32(1), atomic.LoadInt32(&reportCnt),
+		"the branch prepares and reports phase-1 success after the in-branch fallback")
 }
 
 func TestXAConn_BeginTx_DoesNotStartPhysicalTx(t *testing.T) {

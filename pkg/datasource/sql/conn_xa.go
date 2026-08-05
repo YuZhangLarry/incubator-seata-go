@@ -90,7 +90,7 @@ func (c *XAConn) QueryContext(ctx context.Context, query string, args []driver.N
 		}()
 	}
 
-	ret, err := c.createNewTxOnExecIfNeed(ctx, true, func() (types.ExecResult, error) {
+	ret, err := c.createNewTxOnExecIfNeed(ctx, true, query, args, func() (types.ExecResult, error) {
 		ret, err := c.Conn.QueryContext(ctx, query, args)
 		if err != nil {
 			return nil, err
@@ -110,7 +110,7 @@ func (c *XAConn) ExecContext(ctx context.Context, query string, args []driver.Na
 		}()
 	}
 
-	ret, err := c.createNewTxOnExecIfNeed(ctx, false, func() (types.ExecResult, error) {
+	ret, err := c.createNewTxOnExecIfNeed(ctx, false, query, args, func() (types.ExecResult, error) {
 		ret, err := c.Conn.ExecContext(ctx, query, args)
 		if err != nil {
 			return nil, err
@@ -200,7 +200,7 @@ func (c *XAConn) createOnceTxContext(ctx context.Context) bool {
 	return onceTx
 }
 
-func (c *XAConn) createNewTxOnExecIfNeed(ctx context.Context, isQuery bool, f func() (types.ExecResult, error)) (types.ExecResult, error) {
+func (c *XAConn) createNewTxOnExecIfNeed(ctx context.Context, isQuery bool, query string, args []driver.NamedValue, f func() (types.ExecResult, error)) (types.ExecResult, error) {
 	var (
 		tx           driver.Tx
 		err          error
@@ -243,36 +243,31 @@ func (c *XAConn) createNewTxOnExecIfNeed(ctx context.Context, isQuery bool, f fu
 
 	// execute SQL
 	ret, err := f()
-	if err != nil {
-		// driver.ErrSkip is not a real failure: it asks database/sql to retry this
-		// statement through the Prepare+Exec fallback path.
-		if errors.Is(err, driver.ErrSkip) {
-			// If we already opened an XA branch for this statement (autoCommit mode),
-			// the fallback retry would run OUTSIDE the branch - autoCommit is now false
-			// and txCtx has been reset - leaving this branch registered-but-never-
-			// prepared (a leak) and the retried write escaping the global transaction.
-			// Roll the branch back and surface a real (non-ErrSkip) error so the caller
-			// fails fast instead of silently corrupting the global transaction.
-			//
-			// TRADEOFF: because the branch is opened (BeginTx) BEFORE f() runs, any
-			// statement that legitimately needs the Prepare+Exec fallback - i.e. one the
-			// direct Execer/Queryer cannot handle and answers with driver.ErrSkip, such
-			// as certain named/typed argument forms - turns from "retryable" into a hard
-			// error under XA autoCommit + global transaction. Statements that never emit
-			// ErrSkip (the common case) are unaffected. A cleaner fix would open the XA
-			// branch lazily - probe/execute first and register the branch only after the
-			// direct path is confirmed - so ErrSkip can take the fallback without a branch
-			// to unwind; that reorders the XA lifecycle and is left as a follow-up.
-			if tx != nil {
-				if rollbackErr := tx.Rollback(); rollbackErr != nil {
-					log.Errorf("failed to rollback xa branch of :%s after ErrSkip, err:%v", c.txCtx.XID, rollbackErr)
-				}
-				xaRollbacked = true
-				return nil, fmt.Errorf("xa branch %s cannot fall back to non-XA execution after XA START: %v", c.txCtx.XID, err)
-			}
-			// No branch opened yet - safe to let database/sql use its fallback path.
+	if err != nil && errors.Is(err, driver.ErrSkip) {
+		// driver.ErrSkip is not a real failure: with the default go-sql-driver DSN
+		// (interpolateParams=false) the direct Execer/Queryer answers ErrSkip for any
+		// statement carrying bind parameters, asking database/sql to retry it through
+		// the Prepare+Exec fallback path.
+		if tx == nil {
+			// No XA branch opened for this statement - safe to hand the retry back to
+			// database/sql and let it run its own Prepare+Exec fallback.
 			return nil, err
 		}
+		// We already opened an XA branch (XA START) for this statement. We cannot hand
+		// the retry back to database/sql: it would run on a *different* pooled
+		// connection (autoCommit is now false and txCtx has been reset), leaving this
+		// branch registered-but-never-prepared (a leak) and letting the retried write
+		// escape the global transaction. Instead run the Prepare+Exec fallback
+		// OURSELVES on this same physical connection, which still holds XA START open,
+		// so the retried statement stays inside the branch and the normal XA END +
+		// XA PREPARE commit below applies unchanged. These helpers never return ErrSkip.
+		if isQuery {
+			ret, err = c.queryPreparedInBranch(ctx, query, args)
+		} else {
+			ret, err = c.execPreparedInBranch(ctx, query, args)
+		}
+	}
+	if err != nil {
 		// On real error, rollback the entire branch. Prefer XATx.Rollback so the
 		// already-registered branch reports phase-1 failure to the TC; fall back to
 		// the raw connection rollback for non-autoCommit paths.
@@ -324,6 +319,63 @@ func (c *XAConn) createNewTxOnExecIfNeed(ctx context.Context, isQuery bool, f fu
 	}
 
 	return ret, nil
+}
+
+// execPreparedInBranch runs an ExecContext statement through the driver's
+// Prepare+Exec path on the XAConn's own physical connection, which is still inside
+// the open XA branch (XA START has been issued and not yet ended). It exists so a
+// statement that answers driver.ErrSkip on the direct Execer path - the default
+// go-sql-driver behavior for parameterized statements - can still be executed
+// without handing the retry back to database/sql, which would run it on a different
+// connection outside the branch. Unlike the direct path this never returns
+// driver.ErrSkip: it either produces a concrete result or a concrete error.
+func (c *XAConn) execPreparedInBranch(ctx context.Context, query string, args []driver.NamedValue) (types.ExecResult, error) {
+	preparer, ok := c.Conn.targetConn.(driver.ConnPrepareContext)
+	if !ok {
+		return nil, fmt.Errorf("xa branch %s: driver connection does not support PrepareContext, cannot recover from ErrSkip", c.txCtx.XID)
+	}
+	stmt, err := preparer.PrepareContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer stmt.Close()
+
+	execer, ok := stmt.(driver.StmtExecContext)
+	if !ok {
+		return nil, fmt.Errorf("xa branch %s: prepared statement does not support ExecContext, cannot recover from ErrSkip", c.txCtx.XID)
+	}
+	res, err := execer.ExecContext(ctx, args)
+	if err != nil {
+		return nil, err
+	}
+	return types.NewResult(types.WithResult(res)), nil
+}
+
+// queryPreparedInBranch is the QueryContext counterpart of execPreparedInBranch.
+// The prepared statement must outlive the result set, so it is wrapped in
+// rowsWithStmt, which closes the statement when the rows are closed (this composes
+// with RowsCommitOnClose: draining the rows closes both the driver rows and the
+// statement and then runs the deferred XA END + XA PREPARE).
+func (c *XAConn) queryPreparedInBranch(ctx context.Context, query string, args []driver.NamedValue) (types.ExecResult, error) {
+	preparer, ok := c.Conn.targetConn.(driver.ConnPrepareContext)
+	if !ok {
+		return nil, fmt.Errorf("xa branch %s: driver connection does not support PrepareContext, cannot recover from ErrSkip", c.txCtx.XID)
+	}
+	stmt, err := preparer.PrepareContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	queryer, ok := stmt.(driver.StmtQueryContext)
+	if !ok {
+		_ = stmt.Close()
+		return nil, fmt.Errorf("xa branch %s: prepared statement does not support QueryContext, cannot recover from ErrSkip", c.txCtx.XID)
+	}
+	rows, err := queryer.QueryContext(ctx, args)
+	if err != nil {
+		_ = stmt.Close()
+		return nil, err
+	}
+	return types.NewResult(types.WithRows(&rowsWithStmt{Rows: rows, stmt: stmt})), nil
 }
 
 // xaDeferredCommitTx wraps an XA branch tx whose commit is deferred until the
