@@ -21,6 +21,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"io"
 	"strings"
 	"sync/atomic"
@@ -103,16 +104,31 @@ func (mi *mockSQLInterceptor) After(ctx context.Context, execCtx *types.ExecCont
 }
 
 // simulateExecContextError allows tests to inject driver errors for certain SQL strings.
-// When set, baseMockConn will call this hook for each ExecContext.
+// When set, baseMockConn will call this hook for each direct ExecContext.
 var simulateExecContextError func(query string) error
 
+// simulateQueryContextError injects driver errors for certain SQL strings on the
+// direct QueryContext path (e.g. returning driver.ErrSkip for a parameterized
+// SELECT, as the default go-sql-driver DSN does). When set, baseMockConn calls it
+// for each direct QueryContext.
+var simulateQueryContextError func(query string) error
+
+// simulatePreparedExecError injects an error from the prepared statement's
+// ExecContext, keyed by the query it was prepared with. It lets tests drive the
+// case where the in-branch Prepare+Exec fallback itself fails with a real (non
+// ErrSkip) error, so the branch must roll back and report phase-1 failure.
+var simulatePreparedExecError func(query string) error
+
 // fakePreparedStmt models a driver prepared statement. It is what the driver
-// returns from PrepareContext, and its ExecContext/QueryContext ALWAYS succeed -
+// returns from PrepareContext, and its ExecContext/QueryContext succeed by default -
 // mirroring the real go-sql-driver, where the direct Execer answers driver.ErrSkip
 // for parameterized statements but the Prepare+Exec path executes fine. This lets
 // tests exercise XAConn's in-branch ErrSkip fallback (execPreparedInBranch /
-// queryPreparedInBranch).
-type fakePreparedStmt struct{}
+// queryPreparedInBranch). simulatePreparedExecError can force the prepared exec to
+// fail for the fallback-error rollback path.
+type fakePreparedStmt struct {
+	query string
+}
 
 func (s *fakePreparedStmt) Close() error  { return nil }
 func (s *fakePreparedStmt) NumInput() int { return -1 }
@@ -128,6 +144,11 @@ func (s *fakePreparedStmt) Query(args []driver.Value) (driver.Rows, error) {
 }
 
 func (s *fakePreparedStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	if simulatePreparedExecError != nil {
+		if err := simulatePreparedExecError(s.query); err != nil {
+			return nil, err
+		}
+	}
 	return &driver.ResultNoRows, nil
 }
 
@@ -156,14 +177,20 @@ func baseMockConn(mockConn *mock.MockTestDriverConn) {
 
 	// The Prepare+Exec fallback path (used when the direct ExecContext answers
 	// driver.ErrSkip) prepares on the same physical connection and runs the
-	// statement through the prepared stmt, which always succeeds.
+	// statement through the prepared stmt, which succeeds by default. The prepared
+	// stmt keeps the query so simulatePreparedExecError can target it.
 	mockConn.EXPECT().PrepareContext(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(
 		func(ctx context.Context, query string) (driver.Stmt, error) {
-			return &fakePreparedStmt{}, nil
+			return &fakePreparedStmt{query: query}, nil
 		})
 
 	mockConn.EXPECT().QueryContext(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(
 		func(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+			if simulateQueryContextError != nil {
+				if err := simulateQueryContextError(query); err != nil {
+					return nil, err
+				}
+			}
 			rows := &mysqlMockRows{}
 			rows.data = [][]interface{}{
 				{"8.0.29"},
@@ -830,6 +857,144 @@ func TestXAConn_AutoCommit_ParameterizedStmtErrSkipFallsBackInBranch(t *testing.
 	assert.NoError(t, err, "parameterized UPDATE should complete via the in-branch Prepare+Exec fallback")
 	assert.Equal(t, int32(1), atomic.LoadInt32(&reportCnt),
 		"the branch prepares and reports phase-1 success after the in-branch fallback")
+}
+
+// The real #904 scenario is a PARAMETERIZED `SELECT ... FOR UPDATE WHERE id = ?`
+// (the samples all bind parameters). Under the default MySQL DSN the direct Queryer
+// answers driver.ErrSkip for it, so this exercises the query-path in-branch fallback
+// (queryPreparedInBranch) AND the #904 busy-buffer guard together: the fallback rows
+// must still be wrapped in RowsCommitOnClose so the branch commit (XA END + XA
+// PREPARE) is deferred until the caller drains/closes the rows, never issued on top
+// of the still-open result set. Closing the rows also closes the prepared stmt
+// (rowsWithStmt) and then runs XA END + XA PREPARE + the phase-1 report exactly once.
+func TestXAConn_AutoCommit_ParameterizedSelectForUpdateErrSkipDefersBranchCommit(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	CleanTxHooks()
+	defer func() {
+		simulateExecContextError = nil
+		simulateQueryContextError = nil
+		CleanTxHooks()
+	}()
+
+	prevTimeout := xaConnTimeout
+	xaConnTimeout = time.Minute
+	defer func() { xaConnTimeout = prevTimeout }()
+
+	xaConn, mockMgr := newMockXAConn(t, ctrl, 123)
+
+	var reportCnt int32
+	mockMgr.EXPECT().BranchReport(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(
+		func(_ context.Context, param rm.BranchReportParam) error {
+			assert.EqualValues(t, branch.BranchStatusPhaseoneDone, param.Status)
+			atomic.AddInt32(&reportCnt, 1)
+			return nil
+		})
+
+	// The XA control statements run on the direct Execer path and succeed; count when
+	// the deferred branch commit fires.
+	var endCnt, prepareCnt int32
+	simulateExecContextError = func(query string) error {
+		upper := strings.ToUpper(strings.TrimSpace(query))
+		switch {
+		case strings.HasPrefix(upper, "XA END"):
+			atomic.AddInt32(&endCnt, 1)
+		case strings.HasPrefix(upper, "XA PREPARE"):
+			atomic.AddInt32(&prepareCnt, 1)
+		}
+		return nil
+	}
+	// Model the default go-sql-driver DSN: the direct Queryer answers ErrSkip for the
+	// parameterized business SELECT, forcing the in-branch prepared-query fallback.
+	simulateQueryContextError = func(query string) error {
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "SELECT") {
+			return driver.ErrSkip
+		}
+		return nil
+	}
+
+	ctx := tm.InitSeataContext(context.Background())
+	tm.SetXID(ctx, uuid.NewString())
+
+	rows, err := xaConn.QueryContext(ctx, "SELECT * FROM user WHERE id = ? FOR UPDATE",
+		[]driver.NamedValue{{Ordinal: 1, Value: int64(1)}})
+	assert.NoError(t, err, "parameterized SELECT ... FOR UPDATE must complete via the in-branch prepared-query fallback")
+
+	// Even though we fell back to queryPreparedInBranch, the branch commit must still be
+	// deferred while the rows are open - issuing XA END / XA PREPARE now is the #904 bug.
+	_, ok := rows.(*RowsCommitOnClose)
+	assert.True(t, ok, "the in-branch query fallback must still wrap rows in RowsCommitOnClose to defer the branch commit")
+	assert.Equal(t, int32(0), atomic.LoadInt32(&endCnt), "XA END must be deferred until the fallback rows close")
+	assert.Equal(t, int32(0), atomic.LoadInt32(&prepareCnt), "XA PREPARE must be deferred until the fallback rows close")
+	assert.Equal(t, int32(0), atomic.LoadInt32(&reportCnt), "phase-1 report must be deferred until the fallback rows close")
+
+	// Closing the rows closes both the driver rows and the prepared stmt (rowsWithStmt),
+	// then runs the deferred XA END + XA PREPARE + phase-1 report exactly once.
+	assert.NoError(t, rows.Close())
+	assert.Equal(t, int32(1), atomic.LoadInt32(&endCnt), "XA END runs once the fallback rows close")
+	assert.Equal(t, int32(1), atomic.LoadInt32(&prepareCnt), "XA PREPARE runs once the fallback rows close")
+	assert.Equal(t, int32(1), atomic.LoadInt32(&reportCnt), "the branch reports phase-1 done once the fallback rows close")
+}
+
+// When the in-branch Prepare+Exec fallback itself fails with a real (non-ErrSkip)
+// error, the branch must not leak: createNewTxOnExecIfNeed rolls it back and reports
+// phase-1 FAILED to the TC, and surfaces the concrete error (never driver.ErrSkip) to
+// the caller. This guards the post-fallback error path added with the fix.
+func TestXAConn_AutoCommit_InBranchFallbackErrorRollsBackBranch(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	CleanTxHooks()
+	defer func() {
+		simulateExecContextError = nil
+		simulatePreparedExecError = nil
+		CleanTxHooks()
+	}()
+
+	prevTimeout := xaConnTimeout
+	xaConnTimeout = time.Minute
+	defer func() { xaConnTimeout = prevTimeout }()
+
+	xaConn, mockMgr := newMockXAConn(t, ctrl, 123)
+
+	var failedReportCnt int32
+	mockMgr.EXPECT().BranchReport(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(
+		func(_ context.Context, param rm.BranchReportParam) error {
+			if param.Status == branch.BranchStatusPhaseoneFailed {
+				atomic.AddInt32(&failedReportCnt, 1)
+			}
+			return nil
+		})
+
+	// Direct Execer answers ErrSkip for the business UPDATE (default DSN behavior); the
+	// XA control statements succeed.
+	simulateExecContextError = func(query string) error {
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "UPDATE") {
+			return driver.ErrSkip
+		}
+		return nil
+	}
+	// The in-branch prepared exec then fails with a real error (e.g. a constraint
+	// violation) - this is NOT ErrSkip, so it must abort and roll back the branch.
+	prepErr := errors.New("Error 1062: Duplicate entry for key 'PRIMARY'")
+	simulatePreparedExecError = func(query string) error {
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "UPDATE") {
+			return prepErr
+		}
+		return nil
+	}
+
+	ctx := tm.InitSeataContext(context.Background())
+	tm.SetXID(ctx, uuid.NewString())
+
+	_, err := xaConn.ExecContext(ctx, "UPDATE user SET age = age + 1 WHERE id = ?",
+		[]driver.NamedValue{{Ordinal: 1, Value: int64(1)}})
+
+	assert.Error(t, err, "a real error from the in-branch fallback must surface")
+	assert.False(t, errors.Is(err, driver.ErrSkip), "the caller must never see raw driver.ErrSkip - the fix converts it into a concrete result or error")
+	assert.ErrorIs(t, err, prepErr, "the concrete fallback error must be surfaced to the caller")
+	assert.Equal(t, int32(1), atomic.LoadInt32(&failedReportCnt),
+		"the failed branch must report phase-1 FAILED to the TC so it does not leak")
+	assert.False(t, xaConn.xaActive, "the rolled-back branch must leave no active branch on the session")
 }
 
 func TestXAConn_BeginTx_DoesNotStartPhysicalTx(t *testing.T) {
